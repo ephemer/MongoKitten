@@ -71,6 +71,23 @@ final class ReadPreferenceTests: XCTestCase {
         XCTAssertEqual(tagSet?["rack"] as? String, "1")
     }
 
+    func testParsesOrderedTagSetsFromConnectionString() throws {
+        let settings = try ConnectionSettings(
+            "mongodb://localhost/db?readPreference=secondaryPreferred&readPreferenceTags=dc:us-east,rack:1&readPreferenceTags=dc:us-west&readPreferenceTags="
+        )
+        XCTAssertEqual(settings.readPreference?.mode, .secondaryPreferred)
+
+        let tagSets = settings.readPreference?.tagSets
+        XCTAssertEqual(tagSets?.count, 3)
+
+        // Order must be preserved.
+        XCTAssertEqual((tagSets?[0])?["dc"] as? String, "us-east")
+        XCTAssertEqual((tagSets?[0])?["rack"] as? String, "1")
+        XCTAssertEqual((tagSets?[1])?["dc"] as? String, "us-west")
+        // The trailing empty tag set is the catch-all fallback.
+        XCTAssertEqual(tagSets?[2], [:])
+    }
+
     func testNoReadPreferenceByDefault() throws {
         let settings = try ConnectionSettings("mongodb://localhost/db")
         XCTAssertNil(settings.readPreference)

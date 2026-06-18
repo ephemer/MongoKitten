@@ -242,18 +242,24 @@ public struct ConnectionSettings: Equatable, Sendable {
         // Parse all queries
         var queries = [String: String]()
         queries.reserveCapacity(10)
-        
+
+        // Some options (such as `readPreferenceTags`) may appear multiple times and are order-sensitive,
+        // so we also keep the raw pairs in the order they appeared.
+        var orderedQueries = [(name: String, value: String)]()
+
         if let queryString = queryString {
             queryString.split(separator: "&").forEach { queryItem in
                 // queryItem can be either like `someOption` or like `someOption=abc`
                 let queryItemParts = queryItem.split(separator: "=", maxSplits: 1)
                 let queryItemName = String(queryItemParts[0])
                 let queryItemValue = queryItemParts.count > 1 ? String(queryItemParts[1]) : ""
+                let decodedValue = queryItemValue.removingPercentEncoding ?? queryItemValue
 
-                queries[queryItemName] = queryItemValue.removingPercentEncoding
+                queries[queryItemName] = decodedValue
+                orderedQueries.append((queryItemName, decodedValue))
             }
         }
-        
+
         self.queryParameters = queries
         
         // Parse the authentication details, if included
@@ -333,22 +339,24 @@ public struct ConnectionSettings: Equatable, Sendable {
         self.dnsServer = queries["dnsServer"]
 
         if let readPreferenceValue = queries["readPreference"], let mode = ReadPreference.Mode(uriValue: readPreferenceValue) {
-            var tagSets: [Document]?
+            // Each `readPreferenceTags` occurrence describes one tag set, evaluated in the order they
+            // appear. A value formatted as `key:value,key:value` becomes a single tag set document;
+            // an empty value (`readPreferenceTags=`) is the catch-all tag set that matches any member.
+            var tagSets = [Document]()
 
-            // A single `readPreferenceTags` value, formatted as `key:value,key:value`, describes one tag set.
-            if let tagsValue = queries["readPreferenceTags"], !tagsValue.isEmpty {
+            for (name, value) in orderedQueries where name == "readPreferenceTags" {
                 var tagSet = Document()
 
-                for pair in tagsValue.split(separator: ",") {
+                for pair in value.split(separator: ",") {
                     let keyValue = pair.split(separator: ":", maxSplits: 1)
                     guard keyValue.count == 2 else { continue }
                     tagSet[String(keyValue[0])] = String(keyValue[1])
                 }
 
-                tagSets = [tagSet]
+                tagSets.append(tagSet)
             }
 
-            self.readPreference = ReadPreference(mode: mode, tagSets: tagSets)
+            self.readPreference = ReadPreference(mode: mode, tagSets: tagSets.isEmpty ? nil : tagSets)
         }
 
         for key in [
