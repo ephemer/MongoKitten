@@ -129,7 +129,7 @@ public struct ConnectionSettings: Equatable, Sendable {
     /// // or:
     /// settings.readPreference = .secondary
     /// ```
-    public var readPreference: ReadPreference? = nil
+    public var readPreference: ReadPreference?
 
     public var queryParameters: [String: String]
 
