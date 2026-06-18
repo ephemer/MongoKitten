@@ -1,5 +1,6 @@
 import NIOSSL
 import Foundation
+import BSON
 
 fileprivate extension Bool {
     init?(queryValue: String?) {
@@ -117,7 +118,19 @@ public struct ConnectionSettings: Equatable, Sendable {
     public let isSRV: Bool
     
     public var dnsServer: String?
-    
+
+    /// The default read preference for queries that do not specify their own.
+    ///
+    /// Parsed from the `readPreference` (and optional `readPreferenceTags`) connection string options,
+    /// or set programmatically. When `nil`, reads default to the primary (unless ``MongoCluster/slaveOk`` is set).
+    ///
+    /// ```swift
+    /// var settings = try ConnectionSettings("mongodb://localhost/db?readPreference=secondaryPreferred")
+    /// // or:
+    /// settings.readPreference = .secondary
+    /// ```
+    public var readPreference: ReadPreference? = nil
+
     public var queryParameters: [String: String]
 
     /// Initializes a new connection settings instacen.
@@ -319,7 +332,28 @@ public struct ConnectionSettings: Equatable, Sendable {
         self.applicationName = queries["appname"]
         self.dnsServer = queries["dnsServer"]
 
+        if let readPreferenceValue = queries["readPreference"], let mode = ReadPreference.Mode(uriValue: readPreferenceValue) {
+            var tagSets: [Document]?
+
+            // A single `readPreferenceTags` value, formatted as `key:value,key:value`, describes one tag set.
+            if let tagsValue = queries["readPreferenceTags"], !tagsValue.isEmpty {
+                var tagSet = Document()
+
+                for pair in tagsValue.split(separator: ",") {
+                    let keyValue = pair.split(separator: ":", maxSplits: 1)
+                    guard keyValue.count == 2 else { continue }
+                    tagSet[String(keyValue[0])] = String(keyValue[1])
+                }
+
+                tagSets = [tagSet]
+            }
+
+            self.readPreference = ReadPreference(mode: mode, tagSets: tagSets)
+        }
+
         for key in [
+            "readPreference",
+            "readPreferenceTags",
             "appname", 
             "dnsServer", 
             "sslVerify",

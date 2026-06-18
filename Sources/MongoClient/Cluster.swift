@@ -35,8 +35,9 @@ public struct ClusterState {
 ///   - Graceful connection cleanup on shutdown
 ///
 /// - **Read Preference Handling**: Supports MongoDB read preferences (`primary`, `primaryPreferred`, `secondary`,
-///   `secondaryPreferred`, `nearest`) with optional tag sets, both per-query and as a cluster-wide
-///   ``defaultReadPreference``. The legacy `slaveOk` property is still honored as a fallback.
+///   `secondaryPreferred`, `nearest`) with optional tag sets, set per-query or as a default via
+///   ``ConnectionSettings/readPreference`` (e.g. `?readPreference=secondary` in the connection string).
+///   The legacy `slaveOk` property is still honored as a fallback.
 ///
 /// - **Heartbeat Monitoring**: Regularly checks server status via heartbeats (configurable via `heartbeatFrequency`).
 ///   This enables quick detection of topology changes and server status updates.
@@ -193,19 +194,6 @@ public final class MongoCluster: MongoConnectionPool, @unchecked Sendable {
         }
     }
 
-    /// The default read preference used to select a server when a query does not specify one.
-    ///
-    /// When `nil`, the cluster falls back to ``slaveOk``: if `slaveOk` is `true`, reads may be served by any
-    /// member (`nearest`); otherwise reads are served by the primary only.
-    ///
-    /// Per-query read preferences always take precedence over this default.
-    ///
-    /// - Note: This is thread safe.
-    public var defaultReadPreference: ReadPreference? {
-        get { lock.withLock { _defaultReadPreference } }
-        set { lock.withLockVoid { _defaultReadPreference = newValue } }
-    }
-    private var _defaultReadPreference: ReadPreference?
 
     /// Whether metrics are enabled. When enabled, metrics will be collected for queries using the `Metrics` library.
     /// Setting this property will also update all existing pooled connections.
@@ -577,7 +565,8 @@ public final class MongoCluster: MongoConnectionPool, @unchecked Sendable {
             return readPreference
         }
 
-        if let readPreference = defaultReadPreference {
+        // Fall back to the connection-string / settings default, then the legacy `slaveOk` flag.
+        if let readPreference = settings.readPreference {
             return readPreference
         }
 

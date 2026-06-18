@@ -55,6 +55,27 @@ final class ReadPreferenceTests: XCTestCase {
         XCTAssertFalse(preference.matches(memberTags: nil))
     }
 
+    func testParsesFromConnectionString() throws {
+        let settings = try ConnectionSettings("mongodb://localhost/db?readPreference=secondaryPreferred")
+        XCTAssertEqual(settings.readPreference, .secondaryPreferred)
+        // Consumed query params should not leak into queryParameters.
+        XCTAssertNil(settings.queryParameters["readPreference"])
+    }
+
+    func testParsesTagsFromConnectionString() throws {
+        let settings = try ConnectionSettings("mongodb://localhost/db?readPreference=secondary&readPreferenceTags=dc:us-east,rack:1")
+        XCTAssertEqual(settings.readPreference?.mode, .secondary)
+
+        let tagSet = settings.readPreference?.tagSets?.first
+        XCTAssertEqual(tagSet?["dc"] as? String, "us-east")
+        XCTAssertEqual(tagSet?["rack"] as? String, "1")
+    }
+
+    func testNoReadPreferenceByDefault() throws {
+        let settings = try ConnectionSettings("mongodb://localhost/db")
+        XCTAssertNil(settings.readPreference)
+    }
+
     func testTagMatchingUsesFirstSatisfiableTagSet() {
         // The empty tag set acts as a catch-all fallback.
         let preference = ReadPreference(mode: .secondary, tagSets: [["dc": "us-east"], [:]])

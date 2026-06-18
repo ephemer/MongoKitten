@@ -42,6 +42,24 @@ public struct ReadPreference: Sendable, Codable, Equatable {
 
         /// Reads from any available member, primary or secondary.
         case nearest
+
+        /// Parses a read preference mode from a connection string value, case-insensitively.
+        public init?(uriValue: String) {
+            switch uriValue.lowercased() {
+            case "primary":
+                self = .primary
+            case "primarypreferred":
+                self = .primaryPreferred
+            case "secondary":
+                self = .secondary
+            case "secondarypreferred":
+                self = .secondaryPreferred
+            case "nearest":
+                self = .nearest
+            default:
+                return nil
+            }
+        }
     }
 
     /// The mode that determines which members are eligible for a read operation.
