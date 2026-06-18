@@ -34,8 +34,9 @@ public struct ClusterState {
 ///   - Connection health monitoring via heartbeats
 ///   - Graceful connection cleanup on shutdown
 ///
-/// - **Read Preference Handling**: Supports configuring read preferences via the `slaveOk` property to enable reads from secondary nodes
-///   in a replica set.
+/// - **Read Preference Handling**: Supports MongoDB read preferences (`primary`, `primaryPreferred`, `secondary`,
+///   `secondaryPreferred`, `nearest`) with optional tag sets, both per-query and as a cluster-wide
+///   ``defaultReadPreference``. The legacy `slaveOk` property is still honored as a fallback.
 ///
 /// - **Heartbeat Monitoring**: Regularly checks server status via heartbeats (configurable via `heartbeatFrequency`).
 ///   This enables quick detection of topology changes and server status updates.
@@ -191,6 +192,20 @@ public final class MongoCluster: MongoConnectionPool, @unchecked Sendable {
             }
         }
     }
+
+    /// The default read preference used to select a server when a query does not specify one.
+    ///
+    /// When `nil`, the cluster falls back to ``slaveOk``: if `slaveOk` is `true`, reads may be served by any
+    /// member (`nearest`); otherwise reads are served by the primary only.
+    ///
+    /// Per-query read preferences always take precedence over this default.
+    ///
+    /// - Note: This is thread safe.
+    public var defaultReadPreference: ReadPreference? {
+        get { lock.withLock { _defaultReadPreference } }
+        set { lock.withLockVoid { _defaultReadPreference = newValue } }
+    }
+    private var _defaultReadPreference: ReadPreference?
 
     /// Whether metrics are enabled. When enabled, metrics will be collected for queries using the `Metrics` library.
     /// Setting this property will also update all existing pooled connections.
@@ -551,40 +566,111 @@ public final class MongoCluster: MongoConnectionPool, @unchecked Sendable {
         onStateChange(.init(connectionState: connectionState))
     }
 
-    fileprivate func findMatchingExistingConnection(writable: Bool) async -> PooledConnection? {
-        var matchingConnection: PooledConnection?
-
-        nextConnection: for pooledConnection in pool {
-            let connection = pooledConnection.connection
-
-            guard let handshakeResult = await connection.serverHandshake else {
-                continue nextConnection
-            }
-
-            let unwritable = writable && handshakeResult.readOnly ?? false
-            let unreadable = !self.slaveOk && !handshakeResult.ismaster
-
-            if unwritable || unreadable {
-                continue nextConnection
-            }
-
-            matchingConnection = pooledConnection
+    /// Resolves the effective read preference for a request, applying the cluster default and `slaveOk` fallback.
+    private func effectiveReadPreference(for request: ConnectionPoolRequest) -> ReadPreference {
+        // Writes always target the primary, regardless of any configured read preference.
+        if request.requirements.contains(.writable) {
+            return .primary
         }
 
-        return matchingConnection
+        if let readPreference = request.readPreference {
+            return readPreference
+        }
+
+        if let readPreference = defaultReadPreference {
+            return readPreference
+        }
+
+        return slaveOk ? .nearest : .primary
+    }
+
+    /// Determines whether a server, described by its handshake, satisfies the given requirements.
+    private func connectionIsAcceptable(
+        _ handshake: ServerHandshake,
+        writable: Bool,
+        readPreference: ReadPreference
+    ) -> Bool {
+        if writable {
+            // Writes need a writable primary (or a standalone/mongos, which report `ismaster`).
+            return handshake.ismaster && !(handshake.readOnly ?? false)
+        }
+
+        // Standalone servers and `mongos` routers are not replica set members. They serve reads
+        // regardless of mode; for `mongos` the `$readPreference` in the command does the routing.
+        guard handshake.setName != nil else {
+            return true
+        }
+
+        let isPrimary = handshake.ismaster
+        let isSecondary = handshake.secondary ?? false
+
+        // Skip arbiters, hidden and recovering members.
+        guard isPrimary || isSecondary else {
+            return false
+        }
+
+        switch readPreference.mode {
+        case .primary:
+            return isPrimary
+        case .secondary:
+            return isSecondary && readPreference.matches(memberTags: handshake.tags)
+        case .primaryPreferred, .secondaryPreferred, .nearest:
+            if isPrimary {
+                return true
+            }
+
+            return isSecondary && readPreference.matches(memberTags: handshake.tags)
+        }
+    }
+
+    fileprivate func findMatchingExistingConnection(
+        writable: Bool,
+        readPreference: ReadPreference
+    ) async -> PooledConnection? {
+        var acceptable = [(pooled: PooledConnection, handshake: ServerHandshake)]()
+
+        for pooledConnection in pool {
+            guard let handshakeResult = await pooledConnection.connection.serverHandshake else {
+                continue
+            }
+
+            if connectionIsAcceptable(handshakeResult, writable: writable, readPreference: readPreference) {
+                acceptable.append((pooledConnection, handshakeResult))
+            }
+        }
+
+        if acceptable.isEmpty {
+            return nil
+        }
+
+        if writable {
+            return acceptable.last?.pooled
+        }
+
+        // Pick a member that best matches the read preference's intent.
+        switch readPreference.mode {
+        case .primary, .primaryPreferred:
+            return (acceptable.first(where: { $0.handshake.ismaster }) ?? acceptable.first)?.pooled
+        case .secondary, .secondaryPreferred:
+            return (acceptable.first(where: { !$0.handshake.ismaster }) ?? acceptable.first)?.pooled
+        case .nearest:
+            return acceptable.first?.pooled
+        }
     }
 
     /// Attempts to create a connection up to `attempts` times
     /// If all's well, this returns a new connection with the requested specifications
     private func makeConnectionRecursively(for request: ConnectionPoolRequest, attempts: Int = 3) async throws -> MongoConnection {
         var attempts = attempts
+        let writable = request.requirements.contains(.writable)
+        let readPreference = effectiveReadPreference(for: request)
         while true {
             do {
                 if request.requirements.contains(.new) || request.requirements.contains(.notPooled) {
                     // There's no satisfying this request with an existing connection
                     return try await self._createExtraConnection(forRequest: request)
                 } else {
-                    return try await self._getConnection(writable: request.requirements.contains(.writable) || !slaveOk)
+                    return try await self._getConnection(writable: writable, readPreference: readPreference)
                 }
             } catch {
                 attempts -= 1
@@ -606,9 +692,10 @@ public final class MongoCluster: MongoConnectionPool, @unchecked Sendable {
     private func _createExtraConnection(forRequest request: ConnectionPoolRequest, emptyPoolError: Error? = nil) async throws -> MongoConnection {
         let pooledConnection = try await _getPooledConnection(
             writable: request.requirements.contains(.writable),
+            readPreference: effectiveReadPreference(for: request),
             emptyPoolError: emptyPoolError
         )
-        
+
         let newPooledConnection = try await makeConnection(to: pooledConnection.host)
         
         if !request.requirements.contains(.notPooled) {
@@ -622,7 +709,11 @@ public final class MongoCluster: MongoConnectionPool, @unchecked Sendable {
         return newPooledConnection.connection
     }
     
-    private func _getPooledConnection(writable: Bool = true, emptyPoolError: Error? = nil) async throws -> PooledConnection {
+    private func _getPooledConnection(
+        writable: Bool = true,
+        readPreference: ReadPreference = .primary,
+        emptyPoolError: Error? = nil
+    ) async throws -> PooledConnection {
         func createAndPoolConnection(toHost host: ConnectionSettings.Host) async throws -> PooledConnection {
             // make a connection to the provided host and add it to the pool
             let pooledConnection = try await makeConnection(to: host)
@@ -635,18 +726,15 @@ public final class MongoCluster: MongoConnectionPool, @unchecked Sendable {
                 throw MongoError(.cannotConnect, reason: .handshakeFailed)
             }
 
-            let unwritable = writable && handshake.readOnly == true
-            let unreadable = !self.slaveOk && !handshake.ismaster
-
             // check if the connection matches our requirements, if not we recursively try again for the next undiscovered host in our list
-            if unwritable || unreadable {
-                return try await self._getPooledConnection(writable: writable)
-            } else {
+            if connectionIsAcceptable(handshake, writable: writable, readPreference: readPreference) {
                 return pooledConnection
+            } else {
+                return try await self._getPooledConnection(writable: writable, readPreference: readPreference)
             }
         }
 
-        if let matchingConnection = await findMatchingExistingConnection(writable: writable) {
+        if let matchingConnection = await findMatchingExistingConnection(writable: writable, readPreference: readPreference) {
             // If the server has been inactive for longer than `checkLivelinessTimeAmount`
             // Ping first to ensure it's actually alive
             // This prevents queries from stalling out and erroring on cloud providers
@@ -689,9 +777,14 @@ public final class MongoCluster: MongoConnectionPool, @unchecked Sendable {
         return try await createAndPoolConnection(toHost: host)
     }
 
-    private func _getConnection(writable: Bool = true, emptyPoolError: Error? = nil) async throws -> MongoConnection {
+    private func _getConnection(
+        writable: Bool = true,
+        readPreference: ReadPreference = .primary,
+        emptyPoolError: Error? = nil
+    ) async throws -> MongoConnection {
         try await _getPooledConnection(
             writable: writable,
+            readPreference: readPreference,
             emptyPoolError: emptyPoolError
         ).connection
     }

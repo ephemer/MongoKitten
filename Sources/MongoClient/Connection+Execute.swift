@@ -25,6 +25,7 @@ extension MongoConnection {
         namespace: MongoNamespace,
         in transaction: MongoTransaction? = nil,
         sessionId: SessionIdentifier?,
+        readPreference: ReadPreference? = nil,
         logMetadata: Logger.Metadata? = nil,
         traceLabel: String = "executeCommand",
         serviceContext context: ServiceContext? = nil
@@ -34,6 +35,7 @@ extension MongoConnection {
             namespace: namespace,
             in: transaction,
             sessionId: sessionId,
+            readPreference: readPreference,
             logMetadata: logMetadata,
             traceLabel: traceLabel,
             serviceContext: context
@@ -66,6 +68,7 @@ extension MongoConnection {
         namespace: MongoNamespace,
         in transaction: MongoTransaction? = nil,
         sessionId: SessionIdentifier?,
+        readPreference: ReadPreference? = nil,
         logMetadata: Logger.Metadata? = nil,
         traceLabel: String = "executeCommand",
         serviceContext context: ServiceContext? = nil
@@ -76,6 +79,7 @@ extension MongoConnection {
             namespace: namespace,
             in: transaction,
             sessionId: sessionId,
+            readPreference: readPreference,
             logMetadata: logMetadata,
             traceLabel: traceLabel,
             serviceContext: context
@@ -94,6 +98,7 @@ extension MongoConnection {
         namespace: MongoNamespace,
         in transaction: MongoTransaction? = nil,
         sessionId: SessionIdentifier? = nil,
+        readPreference: ReadPreference? = nil,
         logMetadata: Logger.Metadata? = nil,
         traceLabel: String = "executeCommand",
         serviceContext context: ServiceContext? = nil
@@ -104,6 +109,7 @@ extension MongoConnection {
             namespace: namespace,
             in: transaction,
             sessionId: sessionId,
+            readPreference: readPreference,
             logMetadata: logMetadata,
             traceLabel: traceLabel,
             serviceContext: context
@@ -221,6 +227,7 @@ extension MongoConnection {
         namespace: MongoNamespace,
         in transaction: MongoTransaction? = nil,
         sessionId: SessionIdentifier? = nil,
+        readPreference: ReadPreference? = nil,
         logMetadata: Logger.Metadata? = nil,
         traceLabel: String = "executeCommand",
         serviceContext context: ServiceContext? = nil
@@ -232,6 +239,23 @@ extension MongoConnection {
         logMetadata["mongo-query-id"] = .string(String(requestId))
 
         command.appendValue(namespace.databaseName, forKey: "$db")
+
+        // Read preferences only apply to reads, and never inside a transaction (where only the first
+        // operation may carry one, and it must be primary). Writes always target the primary and pass
+        // no read preference, so they are unaffected here.
+        if transaction == nil {
+            if let readPreference, readPreference.mode != .primary {
+                command.appendValue(try BSONEncoder().encode(readPreference), forKey: "$readPreference")
+            } else if readPreference == nil, let handshake = await serverHandshake,
+                      handshake.setName != nil, !handshake.ismaster, handshake.secondary == true {
+                // The selected server is a replica set secondary. Under OP_MSG a secondary rejects reads
+                // unless the command opts in via `$readPreference`, so tag it as a secondary read.
+                command.appendValue(
+                    try BSONEncoder().encode(ReadPreference.secondaryPreferred),
+                    forKey: "$readPreference"
+                )
+            }
+        }
 
         if let id = sessionId?.id {
             logMetadata["mongo-session-id"] = .string(id.data.base64EncodedString())

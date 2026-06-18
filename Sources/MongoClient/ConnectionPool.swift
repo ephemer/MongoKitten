@@ -25,11 +25,28 @@ public struct ConnectionPoolRequirement: Hashable, Sendable {
 /// A request for a connection from a connection pool
 public struct ConnectionPoolRequest: Sendable, ExpressibleByArrayLiteral {
     public let requirements: Set<ConnectionPoolRequirement>
-    
+
+    /// The read preference used to select a server for this request.
+    ///
+    /// When `nil`, the connection pool falls back to its own default (such as ``MongoCluster/defaultReadPreference``).
+    /// Ignored for requests that require a `.writable` connection, since writes always target the primary.
+    public let readPreference: ReadPreference?
+
     public init(arrayLiteral requirements: ConnectionPoolRequirement...) {
         self.requirements = Set(requirements)
+        self.readPreference = nil
     }
-    
+
+    public init(requirements: Set<ConnectionPoolRequirement>, readPreference: ReadPreference? = nil) {
+        self.requirements = requirements
+        self.readPreference = readPreference
+    }
+
+    /// Returns a copy of this request with the given read preference applied.
+    public func withReadPreference(_ readPreference: ReadPreference?) -> ConnectionPoolRequest {
+        ConnectionPoolRequest(requirements: requirements, readPreference: readPreference)
+    }
+
     public static let writable: ConnectionPoolRequest = [.writable]
     public static let basic: ConnectionPoolRequest = []
 }

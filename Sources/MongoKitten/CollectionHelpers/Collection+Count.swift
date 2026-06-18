@@ -15,18 +15,19 @@ extension MongoCollection {
     ///   "activated": true
     /// ])
     /// ```
-    public func count(_ query: Document? = nil) async throws -> Int {
+    public func count(_ query: Document? = nil, readPreference: ReadPreference? = nil) async throws -> Int {
         guard transaction == nil else {
             throw MongoKittenError(.unsupportedFeatureByServer, reason: .transactionForUnsupportedQuery)
         }
-        
-        let connection = try await pool.next(for: .basic)
+
+        let connection = try await pool.next(for: .basic.withReadPreference(readPreference))
         return try await connection.executeCodable(
             CountCommand(on: self.name, where: query),
             decodeAs: CountReply.self,
             namespace: self.database.commandNamespace,
             in: self.transaction,
             sessionId: self.sessionId ?? connection.implicitSessionId,
+            readPreference: readPreference,
             logMetadata: database.logMetadata,
             traceLabel: "Count<\(namespace)>",
             serviceContext: context
@@ -44,7 +45,7 @@ extension MongoCollection {
     /// let usersRegistered = try await users.count()
     /// let usersActivated = try await users.count(""activated" == true")
     /// ```
-    public func count<Query: MongoKittenQuery>(_ query: Query? = nil) async throws -> Int {
-        return try await count(query?.makeDocument())
+    public func count<Query: MongoKittenQuery>(_ query: Query? = nil, readPreference: ReadPreference? = nil) async throws -> Int {
+        return try await count(query?.makeDocument(), readPreference: readPreference)
     }
 }

@@ -80,6 +80,7 @@ public struct AggregateBuilderPipeline: CountableCursor {
     internal var _allowDiskUse: Bool?
     internal var _collation: Collation?
     internal var _readConcern: ReadConcern?
+    internal var _readPreference: ReadPreference?
     internal var _batchSize: Int?
     
     /// Enables disk usage for large datasets that exceed memory limits.
@@ -175,6 +176,22 @@ public struct AggregateBuilderPipeline: CountableCursor {
         pipeline._batchSize = batchSize
         return pipeline
     }
+
+    /// Sets the read preference for this pipeline, determining which replica set members may serve it.
+    ///
+    /// Ignored for writing pipelines (those ending in `$out` or `$merge`), which always target the primary.
+    ///
+    /// ```swift
+    /// let pipeline = collection.buildAggregate {
+    ///     Match(where: "status" == "active")
+    /// }
+    /// .readPreference(.secondaryPreferred)
+    /// ```
+    public func readPreference(_ readPreference: ReadPreference?) -> AggregateBuilderPipeline {
+        var pipeline = self
+        pipeline._readPreference = readPreference
+        return pipeline
+    }
     
     internal func makeCommand() -> AggregateCommand {
         var documents = [Document]()
@@ -205,8 +222,13 @@ public struct AggregateBuilderPipeline: CountableCursor {
         if let connection = connection {
             return connection
         }
-        
-        return try await collection.pool.next(for: .writable)
+
+        // Writing pipelines ($out/$merge) must run on the primary; reads honor the read preference.
+        if writing {
+            return try await collection.pool.next(for: .writable)
+        }
+
+        return try await collection.pool.next(for: .basic.withReadPreference(_readPreference))
     }
     
     /// Executes the pipeline and returns a cursor
@@ -238,6 +260,7 @@ public struct AggregateBuilderPipeline: CountableCursor {
             namespace: self.collection.database.commandNamespace,
             in: self.collection.transaction,
             sessionId: self.collection.sessionId ?? connection.implicitSessionId,
+            readPreference: writing ? nil : _readPreference,
             logMetadata: self.collection.database.logMetadata,
             traceLabel: "Aggregate<\(self.collection.namespace)>",
             serviceContext: aggregateSpan.context

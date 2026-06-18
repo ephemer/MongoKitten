@@ -15,8 +15,8 @@ extension MongoCollection {
                 inCollection: self.name
             ),
             collection: self,
-            makeConnection: { [pool] in
-                return try await pool.next(for: .basic)
+            makeConnection: { [pool] request in
+                return try await pool.next(for: request)
             }
         )
     }
@@ -110,23 +110,30 @@ public final class FindQueryBuilder: CountableCursor, PaginatableCursor {
     public typealias Element = Document
     
     /// The collection this cursor applies to
-    private let makeConnection: @Sendable () async throws -> MongoConnection
+    private let makeConnection: @Sendable (ConnectionPoolRequest) async throws -> MongoConnection
     private let _command: NIOLockedValueBox<FindCommand>
     public var command: FindCommand {
         get { _command.withLockedValue { $0} }
         set { _command.withLockedValue { $0 = newValue } }
     }
+    private let _readPreference = NIOLockedValueBox<ReadPreference?>(nil)
+
+    /// The read preference used to select a server for this query.
+    public var readPreference: ReadPreference? {
+        get { _readPreference.withLockedValue { $0 } }
+        set { _readPreference.withLockedValue { $0 = newValue } }
+    }
     private let collection: MongoCollection
     public var isDrained: Bool { false }
 
-    init(command: FindCommand, collection: MongoCollection, makeConnection: @Sendable @escaping () async throws -> MongoConnection, transaction: MongoTransaction? = nil) {
+    init(command: FindCommand, collection: MongoCollection, makeConnection: @Sendable @escaping (ConnectionPoolRequest) async throws -> MongoConnection, transaction: MongoTransaction? = nil) {
         self._command = NIOLockedValueBox(command)
         self.makeConnection = makeConnection
         self.collection = collection
     }
 
     public func getConnection() async throws  -> MongoConnection {
-        return try await makeConnection()
+        return try await makeConnection(.basic.withReadPreference(readPreference))
     }
 
     @Sendable public func execute() async throws -> FinalizedCursor<FindQueryBuilder> {
@@ -143,6 +150,7 @@ public final class FindQueryBuilder: CountableCursor, PaginatableCursor {
             namespace: MongoNamespace(to: "$cmd", inDatabase: self.collection.database.name),
             in: self.collection.transaction,
             sessionId: self.collection.sessionId ?? connection.implicitSessionId,
+            readPreference: self.readPreference,
             logMetadata: self.collection.database.logMetadata,
             traceLabel: "Find<\(collection.namespace)>",
             serviceContext: findSpan.context
@@ -175,13 +183,14 @@ public final class FindQueryBuilder: CountableCursor, PaginatableCursor {
         count.skip = find.skip
         count.readConcern = find.readConcern
 
-        let connection = try await makeConnection()
+        let connection = try await makeConnection(.basic.withReadPreference(readPreference))
         return try await connection.executeCodable(
             count,
             decodeAs: CountReply.self,
             namespace: self.collection.database.commandNamespace,
             in: self.collection.database.transaction,
             sessionId: self.collection.database.sessionId ?? connection.implicitSessionId,
+            readPreference: self.readPreference,
             logMetadata: self.collection.database.logMetadata
         ).count
     }
@@ -243,6 +252,16 @@ public final class FindQueryBuilder: CountableCursor, PaginatableCursor {
     /// Sets the batch size for this cursor, limiting the amount of documents returned per roundtrip
     public func batchSize(_ batchSize: Int) -> FindQueryBuilder {
         self.command.batchSize = batchSize
+        return self
+    }
+
+    /// Sets the read preference for this query, determining which replica set members may serve it.
+    ///
+    /// ```swift
+    /// let users = users.find().readPreference(.secondaryPreferred)
+    /// ```
+    public func readPreference(_ readPreference: ReadPreference?) -> FindQueryBuilder {
+        self.readPreference = readPreference
         return self
     }
 }
